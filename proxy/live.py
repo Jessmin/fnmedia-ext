@@ -18,6 +18,7 @@ from collections import OrderedDict, deque
 from threading import Lock
 
 import client as clientmod
+from measured_quality import measurements
 
 # 每设备保留的最近请求条数 / 设备上限 / 会话空闲过期（秒）
 MAX_EVENTS_PER_DEVICE = 60
@@ -45,7 +46,7 @@ def reset() -> None:
 
 def record(ua: str, ip: str, method: str, path: str, query: str,
            status: int, origin: str, title: str = "", stage: str = "",
-           note: str = "") -> None:
+           note: str = "", quality_key=None) -> None:
     """记录一条播放链路请求。
 
     origin: local=本插件构造；upstream=透传官方；mixed=先查官方再合并；redirect=302。
@@ -94,6 +95,7 @@ def record(ua: str, ip: str, method: str, path: str, query: str,
             sess["status"] = status
             sess["at"] = round(now, 3)
             sess["path"] = path
+            sess["_quality_key"] = quality_key
             if is_err:
                 sess["error"] = f"{status} {note or path}"[:120]
             else:
@@ -106,6 +108,7 @@ def record(ua: str, ip: str, method: str, path: str, query: str,
             if sess is not None:
                 sess["at"] = round(now, 3)
                 sess["status"] = status
+                sess["_quality_key"] = quality_key
                 if is_err:
                     sess["error"] = f"{status} {note or path}"[:120]
                 elif status < 400:
@@ -122,6 +125,17 @@ def snapshot() -> dict:
                 continue
             sess = dev.get("session")
             active = bool(sess and now - sess.get("at", 0) < SESSION_TTL)
+            current = dict(sess) if active else None
+            if current is not None:
+                key = current.pop("_quality_key", None)
+                if key is not None:
+                    measured = measurements.get(key)
+                    current["quality_state"] = "measured" if measured else "pending"
+                    if measured:
+                        current["measured_quality"] = {
+                            "width": measured.width, "height": measured.height,
+                            "label": measured.label,
+                        }
             out.append({
                 "id": dev["id"], "kind": dev["kind"], "label": dev["label"],
                 "ip": dev["ip"], "ua": dev["ua"],
@@ -129,7 +143,7 @@ def snapshot() -> dict:
                 "ago": round(now - dev["seen"], 1),
                 "reqs": dev["reqs"], "errors": dev["errors"],
                 "last_status": dev["last_status"], "last_path": dev["last_path"],
-                "active": active, "session": sess if active else None,
+                "active": active, "session": current,
                 "events": list(dev["events"])[-30:][::-1],
             })
     out.sort(key=lambda d: d["seen"], reverse=True)

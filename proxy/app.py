@@ -42,6 +42,7 @@ import t4_metadata
 from t4_browser import T4Browser, LIB_GUID as T4_LIB_GUID, LIB_TITLE as T4_LIB_TITLE
 import client as clientmod
 import live as livemod
+from measured_quality import measurements
 import panqr
 import inject as inj
 import config as cfgmod
@@ -977,9 +978,9 @@ def _instant_stream_payload(mg: str):
     }
     v = {
         "media_guid": mg, "title": "", "guid": vg_for(mg),
-        "resolution_type": "1080p", "color_range_type": "SDR",
+        "resolution_type": "待检测", "color_range_type": "SDR",
         "codec_name": "h264", "codec_type": "video", "color_range": "tv",
-        "profile": "High", "index": 0, "width": 1920, "height": 1080,
+        "profile": "High", "index": 0, "width": 0, "height": 0,
         "coded_width": 0, "coded_height": 0, "display_aspect_ratio": "16:9",
         "pix_fmt": "yuv420p", "level": "40", "color_space": "",
         "color_transfer": "", "color_primaries": "", "duration": 0,
@@ -1178,6 +1179,7 @@ async def lifespan(app: FastAPI):
             pass
         if t4_media is not None:
             await t4_media.metadata.close()
+        await measurements.close()
         await app.state.up.aclose()
         await app.state.ext.aclose()
         # 关闭前把防抖未落盘的在线资源缓存同步写一次（issue #42 异步落盘配套）
@@ -1344,7 +1346,8 @@ def _live_record(request: Request, status: int, path: str) -> None:
                     503: "暂无可播片源", 504: "上游超时"}.get(status, "请求失败")
         livemod.record(request.headers.get("user-agent", ""), ip,
                        request.method, path, _diagnostic_query(request), status,
-                       origin, title=title, stage=stage, note=note)
+                       origin, title=title, stage=stage, note=note,
+                       quality_key=getattr(request.state, "measured_quality_key", None))
     except Exception:
         pass  # 诊断本身绝不影响正常请求
 
@@ -3688,6 +3691,8 @@ async def _stream_list_impl(guid: str, request: Request):
         playback = _get_t4_service().cached_playback(target)
         metadata = _get_t4_media().metadata.cached(playback) if playback else None
         t4_metadata.apply(sl, playback.wrapper if playback else "", metadata)
+    elif target:
+        _use_measured_resolution(sl["video_streams"][0], target)
     if quals:
         sl["video_streams"][0]["resolution_type"] = quals[0]["resolution"]
         sl["video_streams"][0]["bps"] = quals[0]["bitrate"]
@@ -4392,6 +4397,49 @@ def _line_of_bitrate(br, lines: list[str]) -> str | None:
     return None
 
 
+def _measured_quality_key(target: dict | None):
+    if not target or any(target.get(key) for key in ("t4", "_pansou_manual", "_xiaoya_manual")):
+        return None
+    title, line, url = (target.get(field) for field in ("online_guid", "line", "url"))
+    index = target.get("index")
+    if not all(isinstance(field, str) and field for field in (title, line, url)):
+        return None
+    if type(index) is not int or index < 0:
+        return None
+    # URL or request headers may be signed. Keep only a digest in the memory cache.
+    headers = target.get("headers") or {}
+    if not isinstance(headers, dict):
+        return None
+    try:
+        source = json.dumps([url, headers], sort_keys=True)
+    except (TypeError, ValueError):
+        return None
+    return title, index, line, hashlib.sha256(source.encode()).digest()
+
+
+def _measured_resolution(target: dict):
+    key = _measured_quality_key(target)
+    return measurements.get(key) if key is not None else None
+
+
+def _quality_line_label(target: dict) -> str:
+    name = target.get("label") or _friendly_line(target["line"])
+    key = _measured_quality_key(target)
+    if key is None:
+        return name
+    resolution = measurements.get(key)
+    if resolution:
+        return f"{name} · 实测 {resolution.label}"
+    return f"{name} · 画质待检测"
+
+
+def _use_measured_resolution(video: dict, target: dict) -> None:
+    resolution = _measured_resolution(target)
+    if resolution:
+        video.update(width=resolution.width, height=resolution.height,
+                     resolution_type=resolution.label)
+
+
 def _qualities(target: dict) -> list[dict]:
     """把每条播放线路表达成播放器「清晰度」菜单里的一个可选项。"""
     lines = _line_choices(target)
@@ -4401,7 +4449,7 @@ def _qualities(target: dict) -> list[dict]:
     out = []
     for t in lines:
         out.append({
-            "resolution": t.get("label") or _friendly_line(t["line"]),
+            "resolution": _quality_line_label(t),
             "bitrate": _line_bitrate(t["line"]),
             "progressive": True,
             "is_m3u8": False,  # 置 False 才不会被菜单项置灰
@@ -4538,6 +4586,7 @@ async def stream_post(request: Request):
         sl = inj.stream_list(brief)
     f = sl["files"][0]
     v = sl["video_streams"][0]
+    _use_measured_resolution(v, target)
     quals = _qualities(target)
     if quals:
         # 高亮必须与【实际播放线路 target.line】一致，不能盲目标第一条，
@@ -4548,8 +4597,7 @@ async def stream_post(request: Request):
                     == target.get("line")), None)
         if cur is None:
             cur = next((q for q in quals
-                        if q["resolution"] == (target.get("label")
-                                               or _friendly_line(target["line"]))),
+                        if q["resolution"] == _quality_line_label(target)),
                        quals[0])
         v["resolution_type"] = cur["resolution"]
         v["bps"] = cur["bitrate"]
@@ -6674,9 +6722,8 @@ async def _resolve_if_needed(picked: dict, request: Request) -> dict:
 
 
 # ===== 起播速度优化：播放列表短时缓存/预热 =====
-# 说明：分辨率（清晰度）探测模块已整体搁置（ffprobe/额外分片占用资源、慢源下不稳定），
+# 说明：起播及清单阶段不额外拉取分片做分辨率探测。
 # preset 线路菜单只显示线路名、不再追加分辨率；quality.py 仅保留 PNG 伪装分片解包用途。
-# 后续有更优的识别方案再行接入。
 
 
 # 改写后的媒体播放列表短时内存缓存，避免同一集起播/重试反复抓上游。
@@ -7859,6 +7906,14 @@ async def hls_seg(mg: str, request: Request):
             await r.aread()
         finally:
             await r.aclose()
+
+    quality_key = None
+    if (picked and r.status_code in (200, 206)
+            and request.query_params.get("line") == picked.get("line")
+            and request.query_params.get("index") == str(picked.get("index"))
+            and (r.status_code == 200 or r.headers.get("content-range", "").startswith("bytes 0-"))):
+        quality_key = _measured_quality_key(picked)
+        request.state.measured_quality_key = quality_key
     if _can_stream:
         # 播放中实时分片测速上下文（用于持续慢源静默换线）
         _tog = (picked.get("online_guid", "") if picked else "") or \
@@ -7873,6 +7928,8 @@ async def hls_seg(mg: str, request: Request):
             sniffed = False
             nbytes = 0
             ait = r.aiter_raw(64 * 1024)
+            sample = measurements.reserve(quality_key) if quality_key is not None else None
+            complete = False
             try:
                 async for chunk in ait:
                     nbytes += len(chunk)
@@ -7890,14 +7947,27 @@ async def hls_seg(mg: str, request: Request):
                                 buf = payload if payload is not None else buf
                             except Exception:
                                 pass
+                            if sample:
+                                sample.feed(buf)
+                            complete = True
                             yield buf
                             return
                         if buf:
+                            if sample:
+                                sample.feed(buf)
                             yield buf
                             buf = b""
                         continue
+                    if sample:
+                        sample.feed(chunk)
                     yield chunk
+                complete = True
             finally:
+                if sample:
+                    if complete:
+                        sample.finish()
+                    else:
+                        sample.cancel()
                 try:
                     await r.aclose()
                 except Exception:
@@ -7964,6 +8034,8 @@ async def hls_seg(mg: str, request: Request):
     h["Content-Length"] = str(len(body))
     if unwrapped or "content-type" not in {k.lower() for k in h}:
         h["Content-Type"] = ctype or "video/mp2t"
+    if quality_key is not None:
+        measurements.submit(quality_key, body)
     if r.status_code in _RETRY_STATUS:
         _log.warning("seg upstream %s %s", r.status_code,
                      urllib.parse.urlsplit(src_url).netloc)

@@ -1124,8 +1124,12 @@ async function loadLive(){
   const current=stageIndex(stage);
   const chain=stages.map(([key,label],i)=>`<div class="chain-step ${i<current?"done":(i===current?"current":"")}"><span class="chain-dot"></span>${label}</div>`).join("");
   const statusClass=Number(latestStatus)>=400?"bad":"ok";
+  const quality=sess?.measured_quality;
+  const qualityBadge=sess?.quality_state==="measured"&&quality
+    ? ` · <span class="tag" title="已播放分片的实际分辨率">实测 ${esc(quality.label)} · ${esc(quality.width)}×${esc(quality.height)}</span>`
+    : (sess?.quality_state==="pending"?' · <span class="tag off">画质待检测</span>':"");
   const nowHtml=`<div class="now-playing"><div class="now-top"><div><div class="now-label">${sess?"当前播放":"最近活动"}</div><h3 class="now-title">${esc(title)}</h3>
-    <div class="now-meta">${esc(focus.label||focus.kind||"设备")} · ${liveOrigin(latest.origin||"local")} · ${LIVE_STAGE[stage]||stage}${sess&&sess.error?" · 播放异常":""}</div></div>
+    <div class="now-meta">${esc(focus.label||focus.kind||"设备")} · ${liveOrigin(latest.origin||"local")} · ${LIVE_STAGE[stage]||stage}${sess&&sess.error?" · 播放异常":""}${qualityBadge}</div></div>
     <div class="response"><strong class="status-code ${statusClass}">${esc(latestStatus)}</strong><span>最近响应</span></div></div>
     <div class="playback-chain" aria-label="当前播放链路">${chain}</div></div>`;
   const events=devs.flatMap(dv=>(dv.events||[]).map(e=>({...e,device:dv.label||dv.kind||"设备"})))
