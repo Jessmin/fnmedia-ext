@@ -1,0 +1,17 @@
+[Unit]
+Description=Wogg T4 bridge for fnmedia-ext
+After=network-online.target
+
+[Service]
+User=fnmedia-bridge
+WorkingDirectory=/opt/fnmedia-wogg
+EnvironmentFile=/opt/fnmedia-wogg/bridge.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/var/apps/fnmedia-ext/target/repo/.venv/bin/python -m uvicorn bridge:app --host 127.0.0.1 --port ${WOGG_T4_PORT} --no-access-log --timeout-keep-alive 5
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

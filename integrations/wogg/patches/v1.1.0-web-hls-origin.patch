@@ -1,0 +1,36 @@
+--- a/proxy/app.py
++++ b/proxy/app.py
+@@ -5345,16 +5345,18 @@
+     return None
+ 
+ 
+-def _t4_media_url(request: Request, mg: str, **params) -> str:
++def _t4_media_url(request: Request, mg: str, *, same_origin: bool = False, **params) -> str:
++    path = f"{ONLINE_PREFIX}/{mg}/t4"
++    query = urllib.parse.urlencode(params)
++    if same_origin:
++        return urllib.parse.urlunsplit(("", "", path, query, ""))
+     # Native STRM players consume this URL without the browser's origin resolution.
+     scheme = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
+     if scheme not in ("http", "https"):
+         scheme = request.url.scheme
+     host = request.headers.get("x-forwarded-host", "").split(",")[0].strip()
+     host = host or request.url.netloc
+-    return urllib.parse.urlunsplit((
+-        scheme, host, f"{ONLINE_PREFIX}/{mg}/t4",
+-        urllib.parse.urlencode(params), ""))
++    return urllib.parse.urlunsplit((scheme, host, path, query, ""))
+ 
+ 
+ async def _t4_play_response(mg: str, target: dict, body: dict, request: Request):
+@@ -5370,7 +5372,9 @@
+     # Headers stay server-side; unsigned public results need no extra media hop.
+     if result.wrapper == "HLS":
+         session = _get_t4_service().create_session(mg, target)
+-        link = _t4_media_url(request, mg, session=session)
++        # The fnOS gateway can strip the browser-facing port and TLS scheme.
++        link = _t4_media_url(request, mg, same_origin=_client_of(request).is_web,
++                             session=session)
+     else:
+         link = _t4_media_url(request, mg, line=target["line"]) \
+             if result.needs_proxy else result.url
