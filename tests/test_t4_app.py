@@ -342,6 +342,23 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(data["cloud_storage_info"])
         self.assertNotIn("direct_link_qualities", data)
 
+    async def test_web_hls_keeps_the_browser_origin_when_gateway_strips_the_port(self):
+        self.wrapper, self.protected = "m3u8", True
+        _, episode = await self.load_episode()
+        mg = storemod.ep_media_guid(episode)
+        response = await self.client.post("/v/api/v1/play/play", json={"media_guid": mg},
+            headers={"User-Agent": "Mozilla/5.0", "Host": "fnmedia.test"})
+        link = response.json()["data"]["play_link"]
+        self.assertTrue(link.startswith(f"/v/media/online/{mg}/t4?session="))
+        response = await self.client.get(link, follow_redirects=False)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.text.startswith("#EXTM3U"))
+
+        response = await self.client.post("/v/api/v1/play/play", json={"media_guid": mg},
+            headers={"User-Agent": "com.trim.media.ios", "Host": "fnmedia.test:5666"})
+        self.assertTrue(response.json()["data"]["play_link"].startswith(
+            f"http://fnmedia.test:5666/v/media/online/{mg}/t4?session="))
+
     async def test_single_line_stream_is_ready_for_every_client_and_container(self):
         self.protected = True
         self.detail_override = {
